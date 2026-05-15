@@ -1,156 +1,355 @@
+# Standalone pipeline to build & deploy the PurviewAccelerators Function App.
+# Run manually from ADO. No template includes, no nested YAML.
+#
+# Inputs:
+#   - Environment        : display label only
+#   - serviceConn        : ADO Azure service connection (ARM)
+#   - functionAppName    : target Function App resource name
+#                          (e.g. funcapp-d-ncus-dm-pvupload)
+#   - pythonVersion      : Python version on the build agent (match the App's runtime)
 
-import configparser
-import os
-import datetime
-from utils.python_cloud_logger_util import logging
-from azure.identity import DefaultAzureCredential
-from azure.keyvault.secrets import SecretClient
+trigger:
+ - none
 
-logger = logging.getLogger(__name__)
+parameters:
+- name: Environment
+  displayName: "Environment"
+  type: string
+  default: Nprod
+  values:
+    - Nprod
+    - Prod
 
-class AppConfiguration:
-    def __init__(self):
-            logger.info({"event": "info", "message": "Initializing app configuration."})
+- name: serviceConn
+  displayName: "ADO Azure service connection"
+  type: string
 
-            # Two-environment model. Env is derived from the Function App's
-            # own name (auto-populated by Azure as WEBSITE_SITE_NAME) so no
-            # custom app setting is needed for the discriminator itself.
-            # FA name pattern: funcapp-<targetEnv>-... e.g. funcapp-p-ncus-...
-            site_name = os.environ.get("WEBSITE_SITE_NAME", "")
-            self.env = 'prod' if '-p-' in site_name else 'nprod'
+- name: functionAppName
+  displayName: "Function App name (e.g. funcapp-d-ncus-dm-pvupload)"
+  type: string
 
-            # Load env-specific config file. ALL env-scoped values now live
-            # here instead of as Function App application settings.
-            config_parser = configparser.RawConfigParser()
-            config_filepath = f'config.{self.env}.ini'
-            config_parser.read(config_filepath)
-            self.userconfig = config_parser["USERCONFIG"]
+- name: pythonVersion
+  displayName: "Python version (must match Function App runtime)"
+  type: string
+  default: "3.10"
+  values:
+    - "3.9"
+    - "3.10"
+    - "3.11"
 
-            # Code-tied constants (same across envs)
-            self.facet_type         = self.userconfig["facet_type"]
-            self.upload_file_system = self.userconfig["upload_file_system"]
+pool:
+  vmImage: 'ubuntu-latest'
 
-            # Env-scoped settings (different per env, sourced from .ini)
-            self.subscription_id      = self.userconfig["SUBSCRIPTION_ID"]
-            self.resource_group       = self.userconfig["RESOURCE_GROUP"]
-            self.tenant_id            = self.userconfig.get("TENANT_ID", "")    # unused after MI refactor; kept for back-compat
-            self.client_id            = self.userconfig.get("CLIENT_ID", "")    # unused after MI refactor; kept for back-compat
-            self.pv_account           = self.userconfig["PV_ACCOUNT"]
-            self.storage_account_name = self.userconfig["STORAGE_ACCOUNT_NAME"]
-            self.key_vault_name       = self.userconfig.get("KEY_VAULT_NAME", "")
+steps:
+- checkout: self
+  displayName: 'Checkout repo'
 
-            #purview endpoints
-            self.account_endpoint = "https://" + self.pv_account + ".purview.azure.com"
-            self.catalog_endpoint = "https://" + self.pv_account + ".purview.azure.com"
-            self.scanning_endpoint = "https://" + self.pv_account + ".scan.purview.azure.com"
-            self.metadatapolicy_endpoint = "https://" + self.pv_account + ".purview.azure.com"
-            self.management_base_url = "https://management.azure.com/"
-            self.cred_scope = "https://purview.azure.net/.default"
-            self.mgmt_scope = "https://management.azure.com/.default"
+- task: UsePythonVersion@0
+  displayName: 'Use Python ${{ parameters.pythonVersion }}'
+  inputs:
+    versionSpec: ${{ parameters.pythonVersion }}
 
-            #MsGraph endpoints
-            self.msgraph_scope = "https://graph.microsoft.com/.default"
+- bash: |
+    set -e
+    pip install --target=".python_packages/lib/site-packages" -r requirements.txt --force-reinstall
+  workingDirectory: '$(System.DefaultWorkingDirectory)/PurviewAccelerators'
+  displayName: 'Install dependencies into .python_packages'
 
-    def get_purview_credential(self):
-        """Get Purview credential via the Function App's managed identity.
+- task: ArchiveFiles@2
+  displayName: 'Zip PurviewAccelerators'
+  inputs:
+    rootFolderOrFile: '$(System.DefaultWorkingDirectory)/PurviewAccelerators'
+    includeRootFolder: false
+    archiveType: 'zip'
+    archiveFile: '$(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip'
+    replaceExistingArchive: true
 
-        Returns:
-            DefaultAzureCredential: credential usable for ``.get_token(scope)``
-            and any Azure SDK client that accepts a ``TokenCredential``.
-        """
-        try:
-            return DefaultAzureCredential()
-        except Exception as err:
-            logger.error(dict(
-                event="error",
-                message="Error occured while getting purview credential.",
-                data=dict(
-                    error=str(err),
-                    )
-                ))
-            raise Exception("Error occured while getting purview credential.")
+- task: AzureFunctionApp@1
+  displayName: 'Deploy to ${{ parameters.functionAppName }} (${{ parameters.Environment }})'
+  inputs:
+    azureSubscription: ${{ parameters.serviceConn }}
+    appType: functionAppLinux
+    appName: ${{ parameters.functionAppName }}
+    package: '$(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip'
 
-    def get_pv_access_token(self):
-        try:
-            return "Bearer "+ self.get_purview_credential().get_token(self.cred_scope).token
-        except Exception as err:
-            logger.error(dict(
-                event="error",
-                message="Error occured while getting purview credential access token.",
-                data=dict(
-                    error=str(err),
-                    )
-                ))
-            raise Exception("Error occured while getting purview credential access token.")
 
-    def get_pv_mgmt_access_token(self):
-        try:
-            return "Bearer "+ self.get_purview_credential().get_token(self.mgmt_scope).token
-        except Exception as err:
-            logger.error(dict(
-                event="error",
-                message="Error occured while getting purview management access token.",
-                data=dict(
-                    error=str(err),
-                    )
-                ))
-            raise Exception("Error occured while getting purview management access token.")
 
-    def get_msgraph_access_token(self):
-        try:
-            return "Bearer "+ self.get_purview_credential().get_token(self.msgraph_scope).token
-        except Exception as err:
-            logger.error(dict(
-                event="error",
-                message="Error occured while getting msgraph access token.",
-                data=dict(
-                    error=str(err),
-                    )
-                ))
-            raise Exception("Error occured while getting msgraph credential access token.")
-        
-    def set_graph_access_token(self):
-        """
-        Sets the microsoft graph access token for your session.
-        """
-        token_req = self.get_purview_credential().get_token(self.msgraph_scope)
-        # self._credential.get_token("https://graph.microsoft.com/.default")
-        self.graph_access_token = token_req.token
-        self.graph_expiration = datetime.datetime.fromtimestamp(token_req.expires_on)
 
-    def get_graph_authentication_headers(self):
-        """
-        Gets the current graph access token or refreshes the token if it
-        has expired.
-        :return: The authorization headers.
-        :rtype: dict(str, str)
-        """
-        if self.graph_expiration <= datetime.datetime.now():
-            self.set_graph_access_token()
 
-        return {
-            "Authorization": "Bearer " + self.graph_access_token,
-            "Content-Type": "application/json",
-            "ConsistencyLevel": "eventual"  ### required by Ms Graph "list" groups API
++++++++++++++++++++++++++++++++++
+
+# Standalone pipeline to upload one file (or a folder of files) into an
+# ADLS Gen2 filesystem under a given folder name. The destination folder is
+# what the bulk-upload functions then accept as `folderName`.
+#
+# Self-contained: no template includes, no external .ps1, no variable groups.
+#
+# Auth: the ADO service connection's service principal (or workload identity)
+# must have "Storage Blob Data Contributor" on the storage account.
+#
+# Usage (Pipelines -> Run pipeline):
+#   - Environment      : display label only
+#   - serviceConn      : ADO ARM service connection
+#   - storageAccount   : storage account NAME (no URL) — e.g. stdncusdmpvupload
+#   - fileSystem       : ADLS Gen2 filesystem (container) — e.g. pvupload
+#   - destinationFolder: target folder inside the filesystem — e.g. myUpload-2026-05-14
+#   - sourcePath       : path RELATIVE to the repo root. Either:
+#                          * a single file:   templates/MetadataBulkUpload.xlsx
+#                          * a folder:        templates/some-batch/
+#                          * a glob:          templates/*.xlsx
+#                        The folder structure under sourcePath is preserved.
+#   - overwrite        : true to overwrite existing files, false to fail-on-conflict
+
+trigger:
+ - none
+
+parameters:
+- name: Environment
+  displayName: "Environment label"
+  type: string
+  default: Nprod
+  values:
+    - Nprod
+    - Prod
+
+- name: serviceConn
+  displayName: "ADO Azure service connection"
+  type: string
+
+- name: storageAccount
+  displayName: "Storage account name (e.g. stdncusdmpvupload)"
+  type: string
+
+- name: fileSystem
+  displayName: "ADLS Gen2 filesystem / container (e.g. pvupload)"
+  type: string
+  default: 'pvupload'
+
+- name: destinationFolder
+  displayName: "Destination folder inside the filesystem"
+  type: string
+
+- name: sourcePath
+  displayName: "Source path / glob relative to repo root"
+  type: string
+
+- name: overwrite
+  displayName: "Overwrite existing files?"
+  type: boolean
+  default: true
+
+pool:
+  name: 'WindowsDevOps'
+
+steps:
+- checkout: self
+  displayName: 'Checkout repo'
+
+- task: AzureCLI@2
+  displayName: 'Upload template(s) to ADLS Gen2'
+  inputs:
+    azureSubscription: ${{ parameters.serviceConn }}
+    scriptType: 'ps'
+    scriptLocation: 'inlineScript'
+    inlineScript: |
+      $account     = "${{ parameters.storageAccount }}"
+      $fs          = "${{ parameters.fileSystem }}"
+      $destFolder  = "${{ parameters.destinationFolder }}"
+      $sourcePath  = "${{ parameters.sourcePath }}"
+      $overwrite   = "${{ parameters.overwrite }}"
+      $sourceFull  = Join-Path "$(System.DefaultWorkingDirectory)" $sourcePath
+
+      Write-Host "Storage account : $account"
+      Write-Host "Filesystem      : $fs"
+      Write-Host "Destination     : $destFolder/"
+      Write-Host "Source          : $sourceFull"
+      Write-Host "Overwrite       : $overwrite"
+
+      # Make sure the destination folder exists (idempotent).
+      az storage fs directory create `
+        --account-name $account `
+        --file-system  $fs `
+        --name         $destFolder `
+        --auth-mode login `
+        --only-show-errors | Out-Null
+
+      $resolved = Get-Item -Path $sourceFull -ErrorAction SilentlyContinue
+      if (-not $resolved) {
+        # Glob path: expand it.
+        $files = @(Get-ChildItem -Path $sourceFull -File -ErrorAction Stop)
+        if ($files.Count -eq 0) {
+          Write-Error "No files matched source path: $sourceFull"
+          exit 1
         }
-    
-    def get_kv_secret(self, client_secret_name):
-        """Get Purview credential
-        Returns:
-            ClientSecretCredential: Purview credential
-        """
-        try:
-            funcapp_credential = DefaultAzureCredential()
-            KV_Uri = f"https://{self.key_vault_name}.vault.azure.net"
-            kv_client = SecretClient(vault_url=KV_Uri, credential=funcapp_credential)
-            client_secret = kv_client.get_secret(client_secret_name)
-            return client_secret.value
-        except Exception as err:
-            logger.error(dict(
-                event="error",
-                message="Error occured while getting purview credential.",
-                data=dict(
-                    error=str(err),
-                    )
-                ))
-            raise Exception("Error occured while getting purview credential.")
+        foreach ($file in $files) {
+          $destPath = "$destFolder/$($file.Name)"
+          Write-Host "Uploading $($file.FullName) -> $fs/$destPath"
+          az storage fs file upload `
+            --account-name $account `
+            --file-system  $fs `
+            --source       "$($file.FullName)" `
+            --path         $destPath `
+            --overwrite    $overwrite `
+            --auth-mode login `
+            --only-show-errors
+        }
+      }
+      elseif ($resolved.PSIsContainer) {
+        # Folder: recursive upload, preserving relative layout.
+        $rootLen = $resolved.FullName.Length
+        Get-ChildItem -Path $resolved.FullName -Recurse -File | ForEach-Object {
+          $relative = $_.FullName.Substring($rootLen).TrimStart('\','/')
+          $relative = $relative -replace '\\','/'
+          $destPath = "$destFolder/$relative"
+          Write-Host "Uploading $($_.FullName) -> $fs/$destPath"
+          az storage fs file upload `
+            --account-name $account `
+            --file-system  $fs `
+            --source       "$($_.FullName)" `
+            --path         $destPath `
+            --overwrite    $overwrite `
+            --auth-mode login `
+            --only-show-errors
+        }
+      }
+      else {
+        # Single file.
+        $destPath = "$destFolder/$($resolved.Name)"
+        Write-Host "Uploading $($resolved.FullName) -> $fs/$destPath"
+        az storage fs file upload `
+          --account-name $account `
+          --file-system  $fs `
+          --source       "$($resolved.FullName)" `
+          --path         $destPath `
+          --overwrite    $overwrite `
+          --auth-mode login `
+          --only-show-errors
+      }
+
+      Write-Host "Upload complete."
+
+
++++++++++++++++++++++++++++++++++++++++++++
+
+
+
+# Standalone pipeline to invoke any HTTP-triggered Azure Function.
+#
+# Drop this file alone into an ADO pipeline definition. It has no external
+# dependencies (no template includes, no external .ps1 file) — pick the
+# environment + function via parameters at queue time.
+#
+# Usage (from ADO UI: Pipelines -> Run pipeline):
+#   - Environment   : DEV | TEST | PROD
+#   - functionAppName: the Function App resource name (e.g. funcapp-d-ncus-dm-pvupload)
+#   - resourceGroup : the RG containing the Function App
+#   - serviceConn   : the ADO service connection (ARM) with rights on the RG
+#   - functionName  : the Azure Function name (exact case, e.g. MetadataBulkUpload)
+#   - route         : URL path AFTER the host (no leading slash, no api-version)
+#                     e.g. "purview-metadata-bulk-upload" or "purview-insights/myFolder"
+#   - bodyJson      : optional JSON body. Leave blank for a no-body POST.
+
+trigger:
+ - none
+
+parameters:
+- name: Environment
+  displayName: "Environment"
+  type: string
+  default: Nprod
+  values:
+    - Nprod
+    - Prod
+
+- name: functionAppName
+  displayName: "Function App name (e.g. funcapp-d-ncus-dm-pvupload)"
+  type: string
+
+- name: resourceGroup
+  displayName: "Resource group of the Function App"
+  type: string
+
+- name: serviceConn
+  displayName: "ADO Azure service connection name"
+  type: string
+
+- name: functionName
+  displayName: "Function name (exact case, e.g. MetadataBulkUpload)"
+  type: string
+
+- name: route
+  displayName: "URL path after host (no leading slash). e.g. purview-insights/{folder}"
+  type: string
+
+- name: bodyJson
+  displayName: "Optional JSON body (leave blank for no body)"
+  type: string
+  default: ''
+
+pool:
+  name: 'WindowsDevOps'
+
+steps:
+- task: AzureCLI@2
+  displayName: 'Fetch function key for ${{ parameters.functionName }}'
+  name: GetFunctionKey
+  inputs:
+    azureSubscription: ${{ parameters.serviceConn }}
+    scriptType: 'ps'
+    scriptLocation: 'inlineScript'
+    inlineScript: |
+      $functionKey = $(az functionapp function keys list `
+        --resource-group "${{ parameters.resourceGroup }}" `
+        --name           "${{ parameters.functionAppName }}" `
+        --function-name  "${{ parameters.functionName }}" `
+        --query "default" -o tsv)
+      if (-not $functionKey) {
+        Write-Error "Could not retrieve function key. Check function name, RG, and service connection RBAC."
+        exit 1
+      }
+      Write-Host "##vso[task.setvariable variable=functionKey;issecret=true]$functionKey"
+
+- task: PowerShell@2
+  displayName: 'POST to ${{ parameters.functionName }}'
+  inputs:
+    targetType: 'inline'
+    script: |
+      $uri = "https://${{ parameters.functionAppName }}.azurewebsites.net/${{ parameters.route }}?code=$(functionKey)"
+      $bodyJson = @'
+      ${{ parameters.bodyJson }}
+      '@
+
+      # Strip the leading/trailing whitespace the heredoc adds
+      $bodyJson = $bodyJson.Trim()
+
+      Write-Host "Target environment : ${{ parameters.Environment }}"
+      Write-Host "Function           : ${{ parameters.functionName }}"
+      Write-Host "POST               : https://${{ parameters.functionAppName }}.azurewebsites.net/${{ parameters.route }}"
+
+      try {
+        if ([string]::IsNullOrWhiteSpace($bodyJson)) {
+          $response = Invoke-RestMethod -Method Post -Uri $uri
+        } else {
+          Write-Host "Request body       : $bodyJson"
+          $response = Invoke-RestMethod `
+            -Method Post `
+            -Uri $uri `
+            -Body $bodyJson `
+            -ContentType 'application/json'
+        }
+        Write-Host "Response: $($response | ConvertTo-Json -Depth 10)"
+      } catch {
+        Write-Host "##vso[task.logissue type=error]Function call failed: $($_.Exception.Message)"
+        if ($_.Exception.Response) {
+          $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+          $body = $reader.ReadToEnd()
+          Write-Host "##vso[task.logissue type=error]Response body: $body"
+        }
+        throw
+      }
+
+
+
+
+
+
