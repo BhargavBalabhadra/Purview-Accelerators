@@ -1,0 +1,156 @@
+
+import configparser
+import os
+import datetime
+from utils.python_cloud_logger_util import logging
+from azure.identity import DefaultAzureCredential
+from azure.keyvault.secrets import SecretClient
+
+logger = logging.getLogger(__name__)
+
+class AppConfiguration:
+    def __init__(self):
+            logger.info({"event": "info", "message": "Initializing app configuration."})
+
+            # Two-environment model. Env is derived from the Function App's
+            # own name (auto-populated by Azure as WEBSITE_SITE_NAME) so no
+            # custom app setting is needed for the discriminator itself.
+            # FA name pattern: funcapp-<targetEnv>-... e.g. funcapp-p-ncus-...
+            site_name = os.environ.get("WEBSITE_SITE_NAME", "")
+            self.env = 'prod' if '-p-' in site_name else 'nprod'
+
+            # Load env-specific config file. ALL env-scoped values now live
+            # here instead of as Function App application settings.
+            config_parser = configparser.RawConfigParser()
+            config_filepath = f'config.{self.env}.ini'
+            config_parser.read(config_filepath)
+            self.userconfig = config_parser["USERCONFIG"]
+
+            # Code-tied constants (same across envs)
+            self.facet_type         = self.userconfig["facet_type"]
+            self.upload_file_system = self.userconfig["upload_file_system"]
+
+            # Env-scoped settings (different per env, sourced from .ini)
+            self.subscription_id      = self.userconfig["SUBSCRIPTION_ID"]
+            self.resource_group       = self.userconfig["RESOURCE_GROUP"]
+            self.tenant_id            = self.userconfig.get("TENANT_ID", "")    # unused after MI refactor; kept for back-compat
+            self.client_id            = self.userconfig.get("CLIENT_ID", "")    # unused after MI refactor; kept for back-compat
+            self.pv_account           = self.userconfig["PV_ACCOUNT"]
+            self.storage_account_name = self.userconfig["STORAGE_ACCOUNT_NAME"]
+            self.key_vault_name       = self.userconfig.get("KEY_VAULT_NAME", "")
+
+            #purview endpoints
+            self.account_endpoint = "https://" + self.pv_account + ".purview.azure.com"
+            self.catalog_endpoint = "https://" + self.pv_account + ".purview.azure.com"
+            self.scanning_endpoint = "https://" + self.pv_account + ".scan.purview.azure.com"
+            self.metadatapolicy_endpoint = "https://" + self.pv_account + ".purview.azure.com"
+            self.management_base_url = "https://management.azure.com/"
+            self.cred_scope = "https://purview.azure.net/.default"
+            self.mgmt_scope = "https://management.azure.com/.default"
+
+            #MsGraph endpoints
+            self.msgraph_scope = "https://graph.microsoft.com/.default"
+
+    def get_purview_credential(self):
+        """Get Purview credential via the Function App's managed identity.
+
+        Returns:
+            DefaultAzureCredential: credential usable for ``.get_token(scope)``
+            and any Azure SDK client that accepts a ``TokenCredential``.
+        """
+        try:
+            return DefaultAzureCredential()
+        except Exception as err:
+            logger.error(dict(
+                event="error",
+                message="Error occured while getting purview credential.",
+                data=dict(
+                    error=str(err),
+                    )
+                ))
+            raise Exception("Error occured while getting purview credential.")
+
+    def get_pv_access_token(self):
+        try:
+            return "Bearer "+ self.get_purview_credential().get_token(self.cred_scope).token
+        except Exception as err:
+            logger.error(dict(
+                event="error",
+                message="Error occured while getting purview credential access token.",
+                data=dict(
+                    error=str(err),
+                    )
+                ))
+            raise Exception("Error occured while getting purview credential access token.")
+
+    def get_pv_mgmt_access_token(self):
+        try:
+            return "Bearer "+ self.get_purview_credential().get_token(self.mgmt_scope).token
+        except Exception as err:
+            logger.error(dict(
+                event="error",
+                message="Error occured while getting purview management access token.",
+                data=dict(
+                    error=str(err),
+                    )
+                ))
+            raise Exception("Error occured while getting purview management access token.")
+
+    def get_msgraph_access_token(self):
+        try:
+            return "Bearer "+ self.get_purview_credential().get_token(self.msgraph_scope).token
+        except Exception as err:
+            logger.error(dict(
+                event="error",
+                message="Error occured while getting msgraph access token.",
+                data=dict(
+                    error=str(err),
+                    )
+                ))
+            raise Exception("Error occured while getting msgraph credential access token.")
+        
+    def set_graph_access_token(self):
+        """
+        Sets the microsoft graph access token for your session.
+        """
+        token_req = self.get_purview_credential().get_token(self.msgraph_scope)
+        # self._credential.get_token("https://graph.microsoft.com/.default")
+        self.graph_access_token = token_req.token
+        self.graph_expiration = datetime.datetime.fromtimestamp(token_req.expires_on)
+
+    def get_graph_authentication_headers(self):
+        """
+        Gets the current graph access token or refreshes the token if it
+        has expired.
+        :return: The authorization headers.
+        :rtype: dict(str, str)
+        """
+        if self.graph_expiration <= datetime.datetime.now():
+            self.set_graph_access_token()
+
+        return {
+            "Authorization": "Bearer " + self.graph_access_token,
+            "Content-Type": "application/json",
+            "ConsistencyLevel": "eventual"  ### required by Ms Graph "list" groups API
+        }
+    
+    def get_kv_secret(self, client_secret_name):
+        """Get Purview credential
+        Returns:
+            ClientSecretCredential: Purview credential
+        """
+        try:
+            funcapp_credential = DefaultAzureCredential()
+            KV_Uri = f"https://{self.key_vault_name}.vault.azure.net"
+            kv_client = SecretClient(vault_url=KV_Uri, credential=funcapp_credential)
+            client_secret = kv_client.get_secret(client_secret_name)
+            return client_secret.value
+        except Exception as err:
+            logger.error(dict(
+                event="error",
+                message="Error occured while getting purview credential.",
+                data=dict(
+                    error=str(err),
+                    )
+                ))
+            raise Exception("Error occured while getting purview credential.")
