@@ -1,355 +1,159 @@
-# Standalone pipeline to build & deploy the PurviewAccelerators Function App.
-# Run manually from ADO. No template includes, no nested YAML.
+# validate_deploy.ps1
+# Diagnoses a Python V2 Function App that deployed successfully but doesn't
+# show its functions in the portal.
 #
-# Inputs:
-#   - Environment        : display label only
-#   - serviceConn        : ADO Azure service connection (ARM)
-#   - functionAppName    : target Function App resource name
-#                          (e.g. funcapp-d-ncus-dm-pvupload)
-#   - pythonVersion      : Python version on the build agent (match the App's runtime)
-
-trigger:
- - none
-
-parameters:
-- name: Environment
-  displayName: "Environment"
-  type: string
-  default: Nprod
-  values:
-    - Nprod
-    - Prod
-
-- name: serviceConn
-  displayName: "ADO Azure service connection"
-  type: string
-
-- name: functionAppName
-  displayName: "Function App name (e.g. funcapp-d-ncus-dm-pvupload)"
-  type: string
-
-- name: pythonVersion
-  displayName: "Python version (must match Function App runtime)"
-  type: string
-  default: "3.10"
-  values:
-    - "3.9"
-    - "3.10"
-    - "3.11"
-
-pool:
-  vmImage: 'ubuntu-latest'
-
-steps:
-- checkout: self
-  displayName: 'Checkout repo'
-
-- task: UsePythonVersion@0
-  displayName: 'Use Python ${{ parameters.pythonVersion }}'
-  inputs:
-    versionSpec: ${{ parameters.pythonVersion }}
-
-- bash: |
-    set -e
-    pip install --target=".python_packages/lib/site-packages" -r requirements.txt --force-reinstall
-  workingDirectory: '$(System.DefaultWorkingDirectory)/PurviewAccelerators'
-  displayName: 'Install dependencies into .python_packages'
-
-- task: ArchiveFiles@2
-  displayName: 'Zip PurviewAccelerators'
-  inputs:
-    rootFolderOrFile: '$(System.DefaultWorkingDirectory)/PurviewAccelerators'
-    includeRootFolder: false
-    archiveType: 'zip'
-    archiveFile: '$(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip'
-    replaceExistingArchive: true
-
-- task: AzureFunctionApp@1
-  displayName: 'Deploy to ${{ parameters.functionAppName }} (${{ parameters.Environment }})'
-  inputs:
-    azureSubscription: ${{ parameters.serviceConn }}
-    appType: functionAppLinux
-    appName: ${{ parameters.functionAppName }}
-    package: '$(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip'
-
-
-
-
-
-+++++++++++++++++++++++++++++++++
-
-# Standalone pipeline to upload one file (or a folder of files) into an
-# ADLS Gen2 filesystem under a given folder name. The destination folder is
-# what the bulk-upload functions then accept as `folderName`.
+# Prereqs:
+#   - Azure CLI installed and `az login` done (or running inside an
+#     AzureCLI@2 task with an active service connection).
+#   - Read access on the Function App + its resource group.
 #
-# Self-contained: no template includes, no external .ps1, no variable groups.
+# Usage:
+#   pwsh ./Utilities/validate_deploy.ps1 -ResourceGroup <rg> -FunctionApp <name>
 #
-# Auth: the ADO service connection's service principal (or workload identity)
-# must have "Storage Blob Data Contributor" on the storage account.
+# Optional:
+#   -ExpectedPython "3.10"     # what your deploy pipeline pinned
+#   -ExpectedFunctionCount 16  # how many functions you registered
 #
-# Usage (Pipelines -> Run pipeline):
-#   - Environment      : display label only
-#   - serviceConn      : ADO ARM service connection
-#   - storageAccount   : storage account NAME (no URL) — e.g. stdncusdmpvupload
-#   - fileSystem       : ADLS Gen2 filesystem (container) — e.g. pvupload
-#   - destinationFolder: target folder inside the filesystem — e.g. myUpload-2026-05-14
-#   - sourcePath       : path RELATIVE to the repo root. Either:
-#                          * a single file:   templates/MetadataBulkUpload.xlsx
-#                          * a folder:        templates/some-batch/
-#                          * a glob:          templates/*.xlsx
-#                        The folder structure under sourcePath is preserved.
-#   - overwrite        : true to overwrite existing files, false to fail-on-conflict
+# Exit codes:
+#   0  all checks passed
+#   1  one or more checks failed (details printed)
 
-trigger:
- - none
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)][string]$ResourceGroup,
+    [Parameter(Mandatory = $true)][string]$FunctionApp,
+    [string]$ExpectedPython = "3.10",
+    [int]$ExpectedFunctionCount = 16
+)
 
-parameters:
-- name: Environment
-  displayName: "Environment label"
-  type: string
-  default: Nprod
-  values:
-    - Nprod
-    - Prod
+$ErrorActionPreference = 'Stop'
+$failures = @()
 
-- name: serviceConn
-  displayName: "ADO Azure service connection"
-  type: string
+function Write-Pass([string]$msg) { Write-Host "  PASS  $msg" -ForegroundColor Green }
+function Write-Fail([string]$msg) { Write-Host "  FAIL  $msg" -ForegroundColor Red;   $script:failures += $msg }
+function Write-Warn([string]$msg) { Write-Host "  WARN  $msg" -ForegroundColor Yellow }
+function Write-Section([string]$msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
 
-- name: storageAccount
-  displayName: "Storage account name (e.g. stdncusdmpvupload)"
-  type: string
+# ---------------------------------------------------------------------------
+Write-Section "1. App settings"
 
-- name: fileSystem
-  displayName: "ADLS Gen2 filesystem / container (e.g. pvupload)"
-  type: string
-  default: 'pvupload'
+$settingsJson = az functionapp config appsettings list `
+    --resource-group $ResourceGroup --name $FunctionApp -o json
+if (-not $settingsJson) {
+    Write-Fail "Could not read app settings. Check RG + FA name and your az login."
+    exit 1
+}
+$settings = ($settingsJson | ConvertFrom-Json) | ForEach-Object { @{ name = $_.name; value = $_.value } }
+$lookup = @{}
+foreach ($s in $settings) { $lookup[$s.name] = $s.value }
 
-- name: destinationFolder
-  displayName: "Destination folder inside the filesystem"
-  type: string
+function Require-Setting([string]$key, [string]$expected = $null, [string]$hint = "") {
+    if (-not $lookup.ContainsKey($key)) {
+        Write-Fail "$key is NOT set. $hint"
+        return
+    }
+    $val = $lookup[$key]
+    if ($expected -and $val -ne $expected) {
+        Write-Fail "$key = '$val' (expected '$expected'). $hint"
+        return
+    }
+    Write-Pass "$key = '$val'"
+}
 
-- name: sourcePath
-  displayName: "Source path / glob relative to repo root"
-  type: string
+Require-Setting "FUNCTIONS_WORKER_RUNTIME"    "python"
+Require-Setting "FUNCTIONS_EXTENSION_VERSION" "~4"
+Require-Setting "WEBSITE_RUN_FROM_PACKAGE"    $null `
+    "Should usually be '1' for zip deploy via AzureFunctionApp@1."
 
-- name: overwrite
-  displayName: "Overwrite existing files?"
-  type: boolean
-  default: true
+if (-not $lookup.ContainsKey("AzureWebJobsFeatureFlags") `
+    -or ($lookup["AzureWebJobsFeatureFlags"] -notmatch "EnableWorkerIndexing")) {
+    Write-Fail "AzureWebJobsFeatureFlags is missing 'EnableWorkerIndexing'. This is the #1 cause of zero functions in the portal. Fix: az functionapp config appsettings set --resource-group $ResourceGroup --name $FunctionApp --settings AzureWebJobsFeatureFlags=EnableWorkerIndexing"
+} else {
+    Write-Pass "AzureWebJobsFeatureFlags includes EnableWorkerIndexing"
+}
 
-pool:
-  name: 'WindowsDevOps'
-
-steps:
-- checkout: self
-  displayName: 'Checkout repo'
-
-- task: AzureCLI@2
-  displayName: 'Upload template(s) to ADLS Gen2'
-  inputs:
-    azureSubscription: ${{ parameters.serviceConn }}
-    scriptType: 'ps'
-    scriptLocation: 'inlineScript'
-    inlineScript: |
-      $account     = "${{ parameters.storageAccount }}"
-      $fs          = "${{ parameters.fileSystem }}"
-      $destFolder  = "${{ parameters.destinationFolder }}"
-      $sourcePath  = "${{ parameters.sourcePath }}"
-      $overwrite   = "${{ parameters.overwrite }}"
-      $sourceFull  = Join-Path "$(System.DefaultWorkingDirectory)" $sourcePath
-
-      Write-Host "Storage account : $account"
-      Write-Host "Filesystem      : $fs"
-      Write-Host "Destination     : $destFolder/"
-      Write-Host "Source          : $sourceFull"
-      Write-Host "Overwrite       : $overwrite"
-
-      # Make sure the destination folder exists (idempotent).
-      az storage fs directory create `
-        --account-name $account `
-        --file-system  $fs `
-        --name         $destFolder `
-        --auth-mode login `
-        --only-show-errors | Out-Null
-
-      $resolved = Get-Item -Path $sourceFull -ErrorAction SilentlyContinue
-      if (-not $resolved) {
-        # Glob path: expand it.
-        $files = @(Get-ChildItem -Path $sourceFull -File -ErrorAction Stop)
-        if ($files.Count -eq 0) {
-          Write-Error "No files matched source path: $sourceFull"
-          exit 1
+$hasAwjStorage = $lookup.ContainsKey("AzureWebJobsStorage") `
+    -or $lookup.ContainsKey("AzureWebJobsStorage__accountName")
+if ($hasAwjStorage) {
+    if ($lookup.ContainsKey("AzureWebJobsStorage__accountName")) {
+        Write-Pass "AzureWebJobsStorage configured via identity (__accountName)"
+        if (-not $lookup.ContainsKey("AzureWebJobsStorage__credential") `
+            -or $lookup["AzureWebJobsStorage__credential"] -ne "managedidentity") {
+            Write-Warn "AzureWebJobsStorage__credential is not 'managedidentity'. Required for MI-based bindings."
         }
-        foreach ($file in $files) {
-          $destPath = "$destFolder/$($file.Name)"
-          Write-Host "Uploading $($file.FullName) -> $fs/$destPath"
-          az storage fs file upload `
-            --account-name $account `
-            --file-system  $fs `
-            --source       "$($file.FullName)" `
-            --path         $destPath `
-            --overwrite    $overwrite `
-            --auth-mode login `
-            --only-show-errors
-        }
-      }
-      elseif ($resolved.PSIsContainer) {
-        # Folder: recursive upload, preserving relative layout.
-        $rootLen = $resolved.FullName.Length
-        Get-ChildItem -Path $resolved.FullName -Recurse -File | ForEach-Object {
-          $relative = $_.FullName.Substring($rootLen).TrimStart('\','/')
-          $relative = $relative -replace '\\','/'
-          $destPath = "$destFolder/$relative"
-          Write-Host "Uploading $($_.FullName) -> $fs/$destPath"
-          az storage fs file upload `
-            --account-name $account `
-            --file-system  $fs `
-            --source       "$($_.FullName)" `
-            --path         $destPath `
-            --overwrite    $overwrite `
-            --auth-mode login `
-            --only-show-errors
-        }
-      }
-      else {
-        # Single file.
-        $destPath = "$destFolder/$($resolved.Name)"
-        Write-Host "Uploading $($resolved.FullName) -> $fs/$destPath"
-        az storage fs file upload `
-          --account-name $account `
-          --file-system  $fs `
-          --source       "$($resolved.FullName)" `
-          --path         $destPath `
-          --overwrite    $overwrite `
-          --auth-mode login `
-          --only-show-errors
-      }
+    } else {
+        Write-Warn "AzureWebJobsStorage is set as a connection string. Works, but consider switching to __accountName + __credential=managedidentity to retire the connection string."
+    }
+} else {
+    Write-Fail "Neither AzureWebJobsStorage nor AzureWebJobsStorage__accountName is set. Queue triggers and host bookkeeping will fail."
+}
 
-      Write-Host "Upload complete."
+# ---------------------------------------------------------------------------
+Write-Section "2. Runtime (Python version)"
 
+$linuxFx = az functionapp config show `
+    --resource-group $ResourceGroup --name $FunctionApp `
+    --query "linuxFxVersion" -o tsv
+if (-not $linuxFx) {
+    Write-Warn "linuxFxVersion is empty (Windows plan?). If Windows, set FUNCTIONS_WORKER_RUNTIME_VERSION instead."
+} elseif ($linuxFx -eq "Python|$ExpectedPython") {
+    Write-Pass "linuxFxVersion = '$linuxFx'"
+} else {
+    Write-Fail "linuxFxVersion = '$linuxFx' (expected 'Python|$ExpectedPython'). Mismatch causes native deps (cryptography, pandas) to fail to load and indexing dies silently."
+}
 
-+++++++++++++++++++++++++++++++++++++++++++
+# ---------------------------------------------------------------------------
+Write-Section "3. Deployed functions"
 
+$funcsJson = az functionapp function list `
+    --resource-group $ResourceGroup --name $FunctionApp -o json 2>$null
+if (-not $funcsJson) {
+    Write-Fail "az functionapp function list returned nothing. Either the app has 0 indexed functions (indexing failed) or you don't have rights to list functions."
+} else {
+    $funcs = $funcsJson | ConvertFrom-Json
+    $count = @($funcs).Count
+    if ($count -eq 0) {
+        Write-Fail "0 functions indexed. Check Log Stream for indexing errors and verify EnableWorkerIndexing is set."
+    } elseif ($count -lt $ExpectedFunctionCount) {
+        Write-Fail "$count of $ExpectedFunctionCount functions indexed. Some bp.py imports are failing. Check Log Stream."
+        $names = @($funcs) | ForEach-Object { ($_.name -split "/")[-1] }
+        Write-Host "  Indexed: $($names -join ', ')"
+    } else {
+        Write-Pass "$count functions indexed (expected $ExpectedFunctionCount)"
+        $names = @($funcs) | ForEach-Object { ($_.name -split "/")[-1] }
+        Write-Host "  Functions: $($names -join ', ')"
+    }
+}
 
+# ---------------------------------------------------------------------------
+Write-Section "4. Last 20 lines from Log Stream (indexing errors usually appear here)"
 
-# Standalone pipeline to invoke any HTTP-triggered Azure Function.
-#
-# Drop this file alone into an ADO pipeline definition. It has no external
-# dependencies (no template includes, no external .ps1 file) — pick the
-# environment + function via parameters at queue time.
-#
-# Usage (from ADO UI: Pipelines -> Run pipeline):
-#   - Environment   : DEV | TEST | PROD
-#   - functionAppName: the Function App resource name (e.g. funcapp-d-ncus-dm-pvupload)
-#   - resourceGroup : the RG containing the Function App
-#   - serviceConn   : the ADO service connection (ARM) with rights on the RG
-#   - functionName  : the Azure Function name (exact case, e.g. MetadataBulkUpload)
-#   - route         : URL path AFTER the host (no leading slash, no api-version)
-#                     e.g. "purview-metadata-bulk-upload" or "purview-insights/myFolder"
-#   - bodyJson      : optional JSON body. Leave blank for a no-body POST.
+try {
+    $logs = az webapp log download `
+        --resource-group $ResourceGroup --name $FunctionApp `
+        --log-file "$env:TEMP\$FunctionApp-logs.zip" 2>$null
+    if (Test-Path "$env:TEMP\$FunctionApp-logs.zip") {
+        Write-Host "  Downloaded logs to $env:TEMP\$FunctionApp-logs.zip"
+        Write-Host "  Expand and inspect /LogFiles/Application for 'Failed to index' or 'ImportError'."
+    } else {
+        Write-Warn "Could not download logs. View Log Stream live in the portal: Function App -> Log stream"
+    }
+} catch {
+    Write-Warn "Log download failed: $($_.Exception.Message). Use the portal's Log Stream instead."
+}
 
-trigger:
- - none
+# ---------------------------------------------------------------------------
+Write-Section "Summary"
 
-parameters:
-- name: Environment
-  displayName: "Environment"
-  type: string
-  default: Nprod
-  values:
-    - Nprod
-    - Prod
-
-- name: functionAppName
-  displayName: "Function App name (e.g. funcapp-d-ncus-dm-pvupload)"
-  type: string
-
-- name: resourceGroup
-  displayName: "Resource group of the Function App"
-  type: string
-
-- name: serviceConn
-  displayName: "ADO Azure service connection name"
-  type: string
-
-- name: functionName
-  displayName: "Function name (exact case, e.g. MetadataBulkUpload)"
-  type: string
-
-- name: route
-  displayName: "URL path after host (no leading slash). e.g. purview-insights/{folder}"
-  type: string
-
-- name: bodyJson
-  displayName: "Optional JSON body (leave blank for no body)"
-  type: string
-  default: ''
-
-pool:
-  name: 'WindowsDevOps'
-
-steps:
-- task: AzureCLI@2
-  displayName: 'Fetch function key for ${{ parameters.functionName }}'
-  name: GetFunctionKey
-  inputs:
-    azureSubscription: ${{ parameters.serviceConn }}
-    scriptType: 'ps'
-    scriptLocation: 'inlineScript'
-    inlineScript: |
-      $functionKey = $(az functionapp function keys list `
-        --resource-group "${{ parameters.resourceGroup }}" `
-        --name           "${{ parameters.functionAppName }}" `
-        --function-name  "${{ parameters.functionName }}" `
-        --query "default" -o tsv)
-      if (-not $functionKey) {
-        Write-Error "Could not retrieve function key. Check function name, RG, and service connection RBAC."
-        exit 1
-      }
-      Write-Host "##vso[task.setvariable variable=functionKey;issecret=true]$functionKey"
-
-- task: PowerShell@2
-  displayName: 'POST to ${{ parameters.functionName }}'
-  inputs:
-    targetType: 'inline'
-    script: |
-      $uri = "https://${{ parameters.functionAppName }}.azurewebsites.net/${{ parameters.route }}?code=$(functionKey)"
-      $bodyJson = @'
-      ${{ parameters.bodyJson }}
-      '@
-
-      # Strip the leading/trailing whitespace the heredoc adds
-      $bodyJson = $bodyJson.Trim()
-
-      Write-Host "Target environment : ${{ parameters.Environment }}"
-      Write-Host "Function           : ${{ parameters.functionName }}"
-      Write-Host "POST               : https://${{ parameters.functionAppName }}.azurewebsites.net/${{ parameters.route }}"
-
-      try {
-        if ([string]::IsNullOrWhiteSpace($bodyJson)) {
-          $response = Invoke-RestMethod -Method Post -Uri $uri
-        } else {
-          Write-Host "Request body       : $bodyJson"
-          $response = Invoke-RestMethod `
-            -Method Post `
-            -Uri $uri `
-            -Body $bodyJson `
-            -ContentType 'application/json'
-        }
-        Write-Host "Response: $($response | ConvertTo-Json -Depth 10)"
-      } catch {
-        Write-Host "##vso[task.logissue type=error]Function call failed: $($_.Exception.Message)"
-        if ($_.Exception.Response) {
-          $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
-          $body = $reader.ReadToEnd()
-          Write-Host "##vso[task.logissue type=error]Response body: $body"
-        }
-        throw
-      }
-
-
-
-
-
-
+if ($failures.Count -eq 0) {
+    Write-Host "All checks passed." -ForegroundColor Green
+    exit 0
+} else {
+    Write-Host "$($failures.Count) check(s) failed:" -ForegroundColor Red
+    foreach ($f in $failures) { Write-Host " - $f" -ForegroundColor Red }
+    Write-Host "`nNext steps:"
+    Write-Host " 1. Fix the failed settings (commands shown above)"
+    Write-Host " 2. Restart the Function App: az functionapp restart -g $ResourceGroup -n $FunctionApp"
+    Write-Host " 3. Wait ~60s, then re-run this script"
+    exit 1
+}
